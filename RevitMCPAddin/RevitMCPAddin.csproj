@@ -555,6 +555,7 @@
     <Compile Include="Core\McpLedger.cs" />
     <Compile Include="Core\Net\BridgeProcessManager.cs" />
     <Compile Include="Core\Net\PortUtil.cs" />
+    <Compile Include="Core\Net\RevitInstanceRegistryGate.cs" />
     <Compile Include="Core\Net\ServerLock.cs" />
     <Compile Include="Core\Net\ServerProcessManager.cs" />
     <Compile Include="Core\ParamResolver.cs" />
@@ -583,6 +584,9 @@
     <Compile Include="Core\ResultDelivery\IResultDeliveryService.cs" />
     <Compile Include="Core\ResultDelivery\FileBackedPendingResultStore.cs" />
     <Compile Include="Core\ResultDelivery\ResultDeliveryService.cs" />
+    <Compile Include="Core\Transport\IRevitBridgeTransport.cs" />
+    <Compile Include="Core\Transport\LegacyHttpRevitBridgeTransport.cs" />
+    <Compile Include="Core\Transport\NamedPipeHandshakeClient.cs" />
     <Compile Include="Core\ResultUtil.cs" />
     <Compile Include="Core\RpcResultEnvelope.cs" />
     <Compile Include="Core\RevitLogger.cs" />

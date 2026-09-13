@@ -5,6 +5,7 @@
 #nullable enable
 using Autodesk.Revit.DB;
 using Autodesk.Revit.UI;
+using Autodesk.Revit.UI.Events;
 using RevitMCPAddin.Core;     // RevitLogger
 using RevitMCPAddin.Core.Net; // ServerProcessManager
 using RevitMCPAddin.Core.Progress;
@@ -45,7 +46,8 @@ namespace RevitMCPAddin
         private static int _selectionMonitorStarted = 0;
         private static int _chatPaneRegistered = 0;
 
-        private static DateTime _lastSelPollUtc = DateTime.MinValue;
+        private static DateTime _lastAuxiliaryPollUtc = DateTime.MinValue;
+        private static DateTime _lastIdlingDispatchUtc = DateTime.MinValue;
         private static string _lastSelDocPath = string.Empty;
         private static string _lastSelDocKey = string.Empty;
         private static int _lastSelViewId = 0;
@@ -118,7 +120,7 @@ namespace RevitMCPAddin
             {
                 Environment.SetEnvironmentVariable("REVIT_MCP_PORT", port.ToString());
                 PortLocator.SaveCurrentPort(port);
-                RevitInstanceStateService.Publish(application, port);
+                RevitInstanceStateService.Publish(application, port, force: true);
             }
             catch (Exception ex)
             {
@@ -278,12 +280,13 @@ namespace RevitMCPAddin
 
             try
             {
-                // SelectionChanged event is not always available from UIControlledApplication.
-                // Idling-based polling is low-risk and works across versions.
+                // Revit 2023+ exposes SelectionChanged. Keep selection snapshots event-driven
+                // instead of polling them on Revit's main UI thread during every Idling cycle.
+                application.SelectionChanged += OnSelectionChangedUpdateStash;
                 application.Idling += OnIdlingUpdateSelectionStash;
                 try { application.ViewActivated += OnViewActivatedBumpContextToken; } catch { /* best-effort */ }
                 try { application.ControlledApplication.DocumentChanged += OnDocumentChangedBumpContextToken; } catch { /* best-effort */ }
-                RevitLogger.Info("Selection monitor started (Idling polling).");
+                RevitLogger.Info("Selection monitor started (SelectionChanged event).");
             }
             catch (Exception ex)
             {
@@ -295,6 +298,7 @@ namespace RevitMCPAddin
         {
             try
             {
+                application.SelectionChanged -= OnSelectionChangedUpdateStash;
                 application.Idling -= OnIdlingUpdateSelectionStash;
                 try { application.ViewActivated -= OnViewActivatedBumpContextToken; } catch { /* ignore */ }
                 try { application.ControlledApplication.DocumentChanged -= OnDocumentChangedBumpContextToken; } catch { /* ignore */ }
@@ -315,113 +319,106 @@ namespace RevitMCPAddin
 
         private static void OnIdlingUpdateSelectionStash(object sender, Autodesk.Revit.UI.Events.IdlingEventArgs e)
         {
+            var uiapp = sender as UIApplication;
+            if (uiapp == null) return;
+
+            var dispatchNow = DateTime.UtcNow;
+            var restoreActive = false;
+            try { restoreActive = ViewWorkspaceRestoreCoordinator.IsActive; } catch { }
+            if (!restoreActive &&
+                _lastIdlingDispatchUtc != DateTime.MinValue &&
+                (dispatchNow - _lastIdlingDispatchUtc).TotalMilliseconds < 1000)
+            {
+                return;
+            }
+            _lastIdlingDispatchUtc = dispatchNow;
+
             // View workspace autosave/restore ticks (best-effort; keep idling safe)
             // Note: must run even when selection/doc/view didn't change (restore state machine relies on Idling).
             try
             {
-                var uiapp = sender as UIApplication;
-                if (uiapp != null) ViewWorkspaceService.OnIdling(uiapp);
-            }
-            catch { }
-            try
-            {
-                var uiapp = sender as UIApplication;
-                if (uiapp != null) HtmlScheduleImportQueueService.OnIdling(uiapp);
-            }
-            catch { }
-            try
-            {
-                var uiapp = sender as UIApplication;
-                if (uiapp != null) RibbonPortUi.RefreshScheduleHtmlQueueButtons(uiapp);
+                ViewWorkspaceService.OnIdling(uiapp);
             }
             catch { }
 
+            if (_lastAuxiliaryPollUtc == DateTime.MinValue ||
+                (dispatchNow - _lastAuxiliaryPollUtc).TotalMilliseconds >= 1000)
+            {
+                _lastAuxiliaryPollUtc = dispatchNow;
+                try { HtmlScheduleImportQueueService.OnIdling(uiapp); } catch { }
+                try { RibbonPortUi.RefreshScheduleHtmlQueueButtons(uiapp); } catch { }
+            }
+
             try
             {
-                var now = DateTime.UtcNow;
-                if (_lastSelPollUtc != DateTime.MinValue && (now - _lastSelPollUtc).TotalMilliseconds < 250)
-                    return;
-                _lastSelPollUtc = now;
+                var doc = uiapp.ActiveUIDocument?.Document;
+                if (doc != null)
+                    RevitInstanceStateService.Publish(doc, AppServices.CurrentPort);
+            }
+            catch { }
+        }
 
-                var uiapp = sender as UIApplication;
-                var uidoc = uiapp?.ActiveUIDocument;
-                var doc = uidoc?.Document;
+        private static void OnSelectionChangedUpdateStash(object sender, SelectionChangedEventArgs e)
+        {
+            try
+            {
+                var doc = e?.GetDocument();
                 if (doc == null) return;
-                try { RevitInstanceStateService.Publish(doc, AppServices.CurrentPort); } catch { }
 
-                // 1) Live selection
-                ICollection<ElementId> sel;
-                try { sel = uidoc.Selection.GetElementIds(); }
-                catch { return; }
+                var selected = e.GetSelectedElements();
+                var idsArr = selected == null
+                    ? Array.Empty<int>()
+                    : selected
+                        .Where(id => id != null)
+                        .Select(id => id.IntValue())
+                        .Where(id => id != 0)
+                        .OrderBy(id => id)
+                        .ToArray();
 
-                var ids = new List<int>(sel != null ? sel.Count : 0);
-                if (sel != null)
-                {
-                    foreach (var id in sel)
-                    {
-                        if (id == null) continue;
-                        int v = id.IntValue();
-                        if (v != 0) ids.Add(v);
-                    }
-                }
-                ids.Sort();
-                var idsArr = ids.ToArray();
-
-                // 2) Context
                 string docPath = string.Empty;
                 string docTitle = string.Empty;
                 int viewId = 0;
                 try { docPath = doc.PathName ?? string.Empty; } catch { }
                 try { docTitle = doc.Title ?? string.Empty; } catch { }
-                try { viewId = uidoc.ActiveView?.Id?.IntValue() ?? 0; } catch { }
-                string docKey = AppServices.CurrentDocKey ?? _lastSelDocKey ?? string.Empty;
-                if (string.IsNullOrWhiteSpace(docKey) || !string.Equals(docPath, _lastSelDocPath, StringComparison.OrdinalIgnoreCase))
+                try { viewId = doc.ActiveView?.Id?.IntValue() ?? 0; } catch { }
+
+                var docKey = AppServices.CurrentDocKey ?? _lastSelDocKey ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(docKey) ||
+                    !string.Equals(docPath, _lastSelDocPath, StringComparison.OrdinalIgnoreCase))
                 {
                     try
                     {
                         string source;
-                        docKey = DocumentKeyUtil.GetDocKeyOrStable(doc, createIfMissing: true, out source);
+                        docKey = DocumentKeyUtil.GetDocKeyOrStable(
+                            doc,
+                            createIfMissing: false,
+                            out source);
                     }
-                    catch { /* ignore */ }
-
-                    if (!string.IsNullOrWhiteSpace(docKey))
-                    {
-                        AppServices.CurrentDocKey = docKey;
-                        _lastSelDocKey = docKey;
-                    }
+                    catch { }
                 }
 
-                bool sameIds = SameSortedIds(idsArr, _lastSelIdsSorted);
-                bool sameDoc = string.Equals(docPath, _lastSelDocPath, StringComparison.OrdinalIgnoreCase);
-                bool sameView = viewId == _lastSelViewId;
-
-                // Bootstrap chat context even when ViewActivated didn't fire yet (common on startup).
-                // Do this before early-return so chat works even if selection/doc/view are unchanged.
-                try
-                {
-                    if (!sameDoc || string.IsNullOrWhiteSpace(AppServices.CurrentDocPathHint))
-                    {
-                        ChatInviteNotifier.UpdateContextFromDocument(doc);
-                    }
-                }
-                catch { /* keep Idling safe */ }
+                var sameIds = SameSortedIds(idsArr, _lastSelIdsSorted);
+                var sameDoc = string.Equals(
+                    docPath,
+                    _lastSelDocPath,
+                    StringComparison.OrdinalIgnoreCase);
+                var sameView = viewId == _lastSelViewId;
                 if (sameIds && sameDoc && sameView) return;
 
                 _lastSelIdsSorted = idsArr;
-                _lastSelDocPath = docPath ?? string.Empty;
+                _lastSelDocPath = docPath;
+                _lastSelDocKey = docKey ?? string.Empty;
                 _lastSelViewId = viewId;
+                if (!string.IsNullOrWhiteSpace(docKey))
+                    AppServices.CurrentDocKey = docKey;
 
                 SelectionStash.Set(idsArr, docPath, docTitle, viewId, docKey);
-
-                // Step 7: bump revision on selection changes (doc/view changes are captured via events).
                 if (!sameIds)
-                {
-                    try { RevitMCPAddin.Core.ContextTokenService.BumpRevision(doc, "SelectionChanged"); } catch { /* ignore */ }
-                }
+                    ContextTokenService.BumpRevision(doc, "SelectionChanged");
             }
             catch
             {
-                // keep Idling safe
+                // SelectionChanged handlers must remain read-only and never disrupt Revit.
             }
         }
 
@@ -432,7 +429,7 @@ namespace RevitMCPAddin
                 var doc = e != null ? e.Document : null;
                 if (doc == null) return;
                 RevitMCPAddin.Core.ContextTokenService.BumpRevision(doc, "ViewActivated");
-                try { RevitInstanceStateService.Publish(doc, AppServices.CurrentPort); } catch { }
+                try { RevitInstanceStateService.Publish(doc, AppServices.CurrentPort, force: true); } catch { }
                 try { ChatInviteNotifier.UpdateContextFromDocument(doc); } catch { }
             }
             catch

@@ -12,5 +12,7 @@ namespace RevitMCPAddin.Core.ResultDelivery
         public int Attempt { get; set; } = 0;
         public string? LastError { get; set; }
         public string? StorePath { get; set; }
+        public bool PayloadReduced { get; set; }
+        public int OriginalPayloadBytes { get; set; }
     }
 }

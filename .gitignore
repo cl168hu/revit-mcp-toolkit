@@ -50,6 +50,8 @@ __pycache__/
 
 # Common generated files
 *.cache
+*.csv
+*.tsv
 *.log
 *.tmp
 *.bak

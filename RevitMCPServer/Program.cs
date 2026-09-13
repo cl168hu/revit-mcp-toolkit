@@ -14,12 +14,14 @@ using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using RevitMcpServer.Engine; // DurableQueue, JobIndex
+using RevitMcpServer.Bridge;
 // SSR dependencies removed
 using RevitMcpServer.Infra; // Logging
 using RevitMcpServer.Persistence; // SqliteConnectionFactory
 using RevitMcpServer.Chat; // ChatStore
 using RevitMcpServer.Capture; // CaptureService
 using RevitMcpServer.Mcp; // MCP adapter
+using RevitMcpServer.Http;
 using RevitMcpServer.Web;
 
 // ----------------------------- Bootstrap -----------------------------
@@ -27,27 +29,71 @@ var builder = WebApplication.CreateBuilder(args);
 var serverStartedUtc = DateTimeOffset.UtcNow;
 
 int startPort = 5210;
+int ownerProcessId = 0;
 try
 {
     var envPort = Environment.GetEnvironmentVariable("PORT") ?? Environment.GetEnvironmentVariable("MCP_SERVER_PORT");
     if (int.TryParse(envPort, out var p) && p > 0 && p < 65536) startPort = p;
-    foreach (var a in args)
+    var envOwnerPid = Environment.GetEnvironmentVariable("REVIT_MCP_OWNER_PID");
+    if (int.TryParse(envOwnerPid, out var ownerFromEnvironment) && ownerFromEnvironment > 0)
+        ownerProcessId = ownerFromEnvironment;
+    for (var i = 0; i < args.Length; i++)
     {
+        var a = args[i];
         if (a.StartsWith("--port=", StringComparison.OrdinalIgnoreCase))
         {
             if (int.TryParse(a.Substring("--port=".Length), out var cli) && cli > 0 && cli < 65536) startPort = cli;
+        }
+        else if (string.Equals(a, "--port", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+        {
+            if (int.TryParse(args[i + 1], out var cli) && cli > 0 && cli < 65536) startPort = cli;
+            i++;
+        }
+        else if (a.StartsWith("--owner-pid=", StringComparison.OrdinalIgnoreCase))
+        {
+            if (int.TryParse(a.Substring("--owner-pid=".Length), out var cliOwner) && cliOwner > 0)
+                ownerProcessId = cliOwner;
+        }
+        else if (string.Equals(a, "--owner-pid", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+        {
+            if (int.TryParse(args[i + 1], out var cliOwner) && cliOwner > 0)
+                ownerProcessId = cliOwner;
+            i++;
         }
     }
 }
 catch { }
 
-var chosenPort = RevitMcpServer.Infra.PortLocker.AcquireAvailablePort(startPort);
+var chosenPort = RevitMcpServer.Infra.PortLocker.AcquireAvailablePort(
+    startPort,
+    ownerProcessId,
+    Environment.ProcessPath ?? string.Empty);
 var bindHost = ResolveBindHost(args);
 builder.WebHost.UseUrls($"http://{bindHost}:{chosenPort}");
-builder.WebHost.ConfigureKestrel(o => { o.Limits.MaxRequestBodySize = 10_000_000; });
+// Normal results are small, but geometry/audit commands can exceed 10 MB.
+// The add-in applies its own hard cap and sends a compact failure envelope above it.
+builder.WebHost.ConfigureKestrel(o => { o.Limits.MaxRequestBodySize = 32_000_000; });
 
 // Services
+builder.Services.AddSingleton<JobDispatchSignal>();
+builder.Services.AddSingleton<JobCompletionSignal>();
 builder.Services.AddSingleton<DurableQueue>();
+builder.Services.AddSingleton<JobLongPollService>();
+builder.Services.AddSingleton<BridgeDispatchCoordinator>();
+var namedPipeHandshakeEnabled = builder.Configuration.GetValue("RevitBridge:NamedPipe:Enabled", true);
+var namedPipeReadOnlyDispatchEnabled = builder.Configuration.GetValue("RevitBridge:NamedPipe:ReadOnlyDispatchEnabled", true);
+var namedPipeWriteReceiptRecoveryEnabled = builder.Configuration.GetValue("RevitBridge:NamedPipe:WriteReceiptRecoveryEnabled", true);
+builder.Services.AddSingleton<NamedPipeBridgeService>(sp => new NamedPipeBridgeService(
+    chosenPort,
+    namedPipeHandshakeEnabled,
+    namedPipeReadOnlyDispatchEnabled,
+    sp.GetRequiredService<BridgeDispatchCoordinator>(),
+    sp.GetRequiredService<DurableQueue>(),
+    sp.GetRequiredService<ILogger<NamedPipeBridgeService>>(),
+    writeDryRunDispatchEnabled: false,
+    writeReceiptRecoveryEnabled: namedPipeWriteReceiptRecoveryEnabled));
+builder.Services.AddHostedService(sp => sp.GetRequiredService<NamedPipeBridgeService>());
+builder.Services.AddHostedService<JobRetentionService>();
 builder.Services.AddSingleton<JobIndex>();
 builder.Services.AddSingleton<ChatRootState>();
 builder.Services.AddSingleton<ChatStore>();
@@ -55,6 +101,10 @@ builder.Services.AddSingleton<CaptureService>();
 builder.Services.AddSingleton<McpSessionStore>();
 
 var app = builder.Build();
+app.Lifetime.ApplicationStopped.Register(() =>
+{
+    try { RevitMcpServer.Infra.PortLocker.Release(chosenPort); } catch { }
+});
 
 app.Use(async (ctx, next) =>
 {
@@ -86,19 +136,31 @@ try { RevitMcpServer.Infra.Logging.Init(chosenPort); } catch { }
 try
 {
     ServerContext.Port = chosenPort;
-    WriteServerPortState(chosenPort);
+    WriteServerPortState(chosenPort, ownerProcessId);
     var qOverride = Environment.GetEnvironmentVariable("REVIT_MCP_QUEUE_DIR") ?? Environment.GetEnvironmentVariable("MCP_QUEUE_DIR");
     SqliteConnectionFactory.Configure(chosenPort, qOverride);
 }
 catch { /* best-effort */ }
 
-// Configure docs/manifest cache path away from wwwroot (SSR removed)
-try { RevitMcpServer.Docs.ManifestRegistry.ConfigureCachePath(Path.Combine(AppContext.BaseDirectory, "Results", "manifest-cache.json")); } catch { }
+// Configure docs/manifest cache path away from wwwroot (SSR removed).
+// The override keeps isolated transport tests away from the installed server cache.
+try
+{
+    var manifestCacheOverride = Environment.GetEnvironmentVariable("REVIT_MCP_MANIFEST_CACHE_PATH");
+    var manifestCachePath = string.IsNullOrWhiteSpace(manifestCacheOverride)
+        ? Path.Combine(AppContext.BaseDirectory, "Results", "manifest-cache.json")
+        : Path.GetFullPath(manifestCacheOverride);
+    RevitMcpServer.Docs.ManifestRegistry.ConfigureCachePath(manifestCachePath);
+}
+catch { }
 try { RevitMcpServer.Docs.ManifestRegistry.LoadFromDisk(); } catch { }
 try { RevitMcpServer.Docs.CapabilitiesGenerator.TryWriteDefault(RevitMcpServer.Docs.ManifestRegistry.GetAll()); } catch { }
 
 // ----------------------------- Root -----------------------------
 app.MapGet("/", () => Results.Json(new { ok = true, port = chosenPort, message = "Revit Automation Server (legacy RPC + MCP)", mcpEndpoint = "/mcp", legacyRpcEndpoint = "/rpc" }));
+
+// Named-pipe discovery. Public builds dispatch only the read-only allowlist.
+app.MapGet("/bridge/info", (NamedPipeBridgeService bridge) => Results.Json(bridge.GetDescriptor()));
 
 // ----------------------------- Health -----------------------------
 app.MapGet("/health", () => Results.Json(new
@@ -107,6 +169,7 @@ app.MapGet("/health", () => Results.Json(new
     port = chosenPort,
     pid = System.Diagnostics.Process.GetCurrentProcess().Id,
     processId = System.Diagnostics.Process.GetCurrentProcess().Id,
+    ownerProcessId = ownerProcessId,
     endpoint = $"http://127.0.0.1:{chosenPort}/rpc",
     startedUtc = serverStartedUtc.ToString("o"),
     time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
@@ -302,7 +365,7 @@ app.MapMethods("/mcp", new[] { "OPTIONS" }, (HttpContext ctx) =>
     return Results.NoContent();
 });
 
-app.MapPost("/mcp", async (HttpContext ctx, DurableQueue durable, JobIndex index, ChatStore chat, CaptureService capture, McpSessionStore sessions) =>
+app.MapPost("/mcp", async (HttpContext ctx, DurableQueue durable, JobLongPollService longPoll, JobIndex index, ChatStore chat, CaptureService capture, McpSessionStore sessions) =>
 {
     var origin = ctx.Request.Headers["Origin"].ToString();
     if (!McpAdapter.IsOriginAllowed(origin))
@@ -470,7 +533,7 @@ app.MapPost("/mcp", async (HttpContext ctx, DurableQueue durable, JobIndex index
             var paramsJson = (toolArgs.HasValue && toolArgs.Value.ValueKind != JsonValueKind.Undefined) ? toolArgs.Value.ToString() : "{}";
             var jobId = await durable.EnqueueAsync(toolName, paramsJson, null, rpcId, 100, 60);
             index.Put(rpcId, jobId);
-            var awaited = await AwaitMcpJobAsync(durable, jobId, TimeSpan.FromSeconds(65));
+            var awaited = await AwaitMcpJobAsync(longPoll, jobId, TimeSpan.FromSeconds(65), ctx.RequestAborted);
             payload = awaited.Payload;
             isError = awaited.IsError;
         }
@@ -591,17 +654,28 @@ app.MapPost("/rpc", async (HttpContext ctx, DurableQueue durable, JobIndex index
 app.MapPost("/enqueue_baseline", () => Results.Json(new { ok = true, note = "baseline enqueue disabled (SSR removed)" }));
 
 // Client -> Add-in: pending request
-app.MapGet("/pending_request", async (HttpContext httpCtx, DurableQueue durable) =>
+app.MapGet("/pending_request", async (
+    HttpContext httpCtx,
+    BridgeDispatchCoordinator bridge,
+    NamedPipeBridgeService namedPipeBridge) =>
 {
     int waitMs = 0; int.TryParse(httpCtx.Request.Query["waitMs"], out waitMs);
-    dynamic? job = null; var start = DateTime.UtcNow;
-    do { job = await durable.ClaimAsync(); if (job != null || waitMs <= 0) break; await Task.Delay(100); } while ((DateTime.UtcNow - start).TotalMilliseconds < waitMs);
+    var reserveJobsForPipe = namedPipeBridge.CanReservePipeJobs;
+    var effectiveWaitMs = reserveJobsForPipe ? Math.Min(waitMs, 1000) : waitMs;
+    var job = await bridge.WaitAndClaimAsync(
+        effectiveWaitMs,
+        httpCtx.RequestAborted,
+        includeMethods: null,
+        excludeMethods: null,
+        markRunning: true,
+        jobPredicate: reserveJobsForPipe
+            ? (method, paramsJson) => !namedPipeBridge.ShouldReserveJobForPipe(method, paramsJson)
+            : null);
     if (job == null) return Results.NoContent();
-    string jobId = (string)job["job_id"]; string method = (string)job["method"]; string pjson = (string)job["params_json"]; string rpcId = job["rpc_id"] != null ? Convert.ToString(job["rpc_id"])! : "1";
-    await durable.StartRunningAsync(jobId);
-    var rpc = new JsonObject { ["jsonrpc"] = JsonValue.Create("2.0"), ["method"] = JsonValue.Create(method), ["params"] = SafeParseOrEmpty(pjson), ["id"] = JsonValue.Create(rpcId) };
+    var rpc = new JsonObject { ["jsonrpc"] = JsonValue.Create("2.0"), ["method"] = JsonValue.Create(job.Method), ["params"] = SafeParseOrEmpty(job.ParamsJson), ["id"] = JsonValue.Create(job.RpcId) };
     var text = rpc.ToJsonString();
-    Logging.Append($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] RESPONSE: pending_request -> {method}");
+    Logging.Append($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] RESPONSE: pending_request transport=legacyHttp method={job.Method} claimWaitMs={job.ClaimWaitMs}");
+    httpCtx.Response.Headers["X-Job-Id"] = job.JobId;
     return Results.Text(text, "application/json", Encoding.UTF8);
 });
 
@@ -720,24 +794,57 @@ app.MapPost("/enqueue", async (HttpContext ctx, DurableQueue durable, JobIndex i
 
 // /cache removed with SSR
 
-app.MapGet("/job/{id}", async (string id, DurableQueue durable) =>
+app.MapGet("/job/{id}", async (string id, HttpContext context, JobLongPollService longPoll) =>
 {
     try
     {
-        var row = await durable.GetAsync(id);
-        if (row != null) return Results.Json(row);
+        if (!JobLongPollService.TryParseWaitMs(
+                context.Request.Query["waitMs"].ToString(),
+                out var waitMs,
+                out var waitError))
+        {
+            return Results.Json(
+                new
+                {
+                    ok = false,
+                    code = "INVALID_WAIT_MS",
+                    msg = waitError,
+                    maxWaitMs = JobLongPollService.MaxWaitMs
+                },
+                statusCode: StatusCodes.Status400BadRequest);
+        }
+
+        context.Response.Headers.CacheControl = "no-store";
+        var outcome = await longPoll.WaitAsync(id, waitMs, context.RequestAborted);
+        if (outcome.Row != null)
+        {
+            context.Response.Headers["X-RevitMCP-Waited-Ms"] = outcome.WaitedMs.ToString(CultureInfo.InvariantCulture);
+            context.Response.Headers["X-RevitMCP-Wait-Timed-Out"] = outcome.TimedOut ? "true" : "false";
+            if (!string.IsNullOrWhiteSpace(outcome.State))
+                context.Response.Headers["X-RevitMCP-Job-State"] = outcome.State;
+            return Results.Json(outcome.Row);
+        }
         return Results.Json(new { ok = false, code = "E_NOT_FOUND" }, statusCode: 404);
+    }
+    catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+    {
+        throw;
     }
     catch (Exception ex) { return Results.Json(new { ok = false, code = "EXCEPTION", msg = ex.Message }, statusCode: 500); }
 });
 
 // Graceful shutdown endpoint (local only)
-app.MapPost("/shutdown", (HttpContext ctx) =>
+app.MapPost("/shutdown", (HttpContext ctx, IHostApplicationLifetime lifetime) =>
 {
     try
     {
-        // respond first, then exit
-        _ = Task.Run(async () => { await Task.Delay(200); Environment.Exit(0); });
+        // Respond first, then stop through the host lifetime so ApplicationStopped
+        // callbacks release the named-pipe listener and exact port lock.
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(200);
+            lifetime.StopApplication();
+        });
         int pid = System.Diagnostics.Process.GetCurrentProcess().Id;
         return Results.Json(new { ok = true, msg = "Shutting down", serverPid = pid });
     }
@@ -873,14 +980,22 @@ static bool IsToolPayloadError(JsonNode? payload)
     return obj["error"] != null;
 }
 
-static async Task<(JsonNode? Payload, bool IsError)> AwaitMcpJobAsync(DurableQueue durable, string jobId, TimeSpan timeout)
+static async Task<(JsonNode? Payload, bool IsError)> AwaitMcpJobAsync(
+    JobLongPollService longPoll,
+    string jobId,
+    TimeSpan timeout,
+    CancellationToken cancellationToken)
 {
     var deadline = DateTimeOffset.UtcNow.Add(timeout);
 
     while (DateTimeOffset.UtcNow < deadline)
     {
-        var row = await durable.GetAsync(jobId);
-        if (row is IDictionary<string, object?> dict)
+        cancellationToken.ThrowIfCancellationRequested();
+        var remainingMs = Math.Max(1, (int)Math.Min(
+            JobLongPollService.MaxWaitMs,
+            (deadline - DateTimeOffset.UtcNow).TotalMilliseconds));
+        var outcome = await longPoll.WaitAsync(jobId, remainingMs, cancellationToken);
+        if (outcome.Row is IDictionary<string, object?> dict)
         {
             var state = Convert.ToString(dict.TryGetValue("state", out var stateObj) ? stateObj : null) ?? string.Empty;
             if (string.Equals(state, "SUCCEEDED", StringComparison.OrdinalIgnoreCase))
@@ -905,8 +1020,16 @@ static async Task<(JsonNode? Payload, bool IsError)> AwaitMcpJobAsync(DurableQue
                 return (payload, true);
             }
         }
-
-        await Task.Delay(250);
+        else
+        {
+            return (SerializeToJsonNode(new
+            {
+                ok = false,
+                jobId,
+                state = "NOT_FOUND",
+                errorMessage = "The durable MCP job was not found."
+            }), true);
+        }
     }
 
     return (SerializeToJsonNode(new { ok = false, jobId, state = "TIMEOUT", errorMessage = "Timed out waiting for MCP tool call result." }), true);
@@ -1105,7 +1228,7 @@ static string ResolveBindHost(string[] args)
     return "127.0.0.1";
 }
 
-static void WriteServerPortState(int chosenPort)
+static void WriteServerPortState(int chosenPort, int ownerProcessId)
 {
     try
     {
@@ -1119,6 +1242,7 @@ static void WriteServerPortState(int chosenPort)
         {
             port = chosenPort,
             pid = pid,
+            ownerProcessId = ownerProcessId,
             startedAtUtc = DateTimeOffset.UtcNow.ToString("o")
         });
         File.WriteAllText(path, json, Encoding.UTF8);

@@ -24,6 +24,13 @@ namespace RevitMCPAddin.ExternalEvents
         public Exception? Exception { get; set; }
     }
 
+    public sealed class CommandExecutionStarted
+    {
+        public string? RpcId { get; set; }
+        public string? CommandName { get; set; }
+        public DateTime StartedAtUtc { get; set; }
+    }
+
     public class RevitCommandExecutor : IExternalEventHandler
     {
         private readonly CommandRouter _router;
@@ -33,6 +40,8 @@ namespace RevitMCPAddin.ExternalEvents
 
         // Optional: worker-provided async result delivery enqueue callback (preferred path).
         public Action<string?, string>? EnqueueResultCallback { get; set; }
+        // Optional: precise ExternalEvent start notification for transport metrics.
+        public Action<CommandExecutionStarted>? CommandStarted { get; set; }
         // Optional: worker notification to continue dispatch serialization.
         public Action<CommandExecutionCompleted>? CommandCompleted { get; set; }
 
@@ -121,6 +130,20 @@ namespace RevitMCPAddin.ExternalEvents
             }
 
             SafeTrace($"[EXEC] command={cmd.Command ?? "(null)"} id={(cmd.Id != null ? cmd.Id.ToString() : "null")}");
+
+            try
+            {
+                CommandStarted?.Invoke(new CommandExecutionStarted
+                {
+                    RpcId = cmd.Id != null ? cmd.Id.ToString() : null,
+                    CommandName = cmd.Command,
+                    StartedAtUtc = DateTime.UtcNow
+                });
+            }
+            catch (Exception ex)
+            {
+                SafeWarn("[EXEC] command-start callback exception: " + ex.Message);
+            }
 
             object resultObj;
             try

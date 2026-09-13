@@ -6,12 +6,14 @@ using System.Net.Http;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Newtonsoft.Json.Linq;
+using RevitMCPAddin.Core.Transport;
 
 namespace RevitMCPAddin.Core.ResultDelivery
 {
     internal sealed class ResultDeliveryService : IResultDeliveryService
     {
-        private readonly HttpClient _client;
+        private readonly IRevitBridgeTransport _transport;
         private readonly Action<string>? _onDelivered;
         private readonly ConcurrentQueue<PendingResultItem> _queue = new ConcurrentQueue<PendingResultItem>();
         private readonly SemaphoreSlim _signal = new SemaphoreSlim(0);
@@ -25,10 +27,12 @@ namespace RevitMCPAddin.Core.ResultDelivery
         private bool _started;
 
         private const int PersistAfterAttempt = 5;
+        // Keep below the server's 32 MB request limit. UTF-8 byte count is used, not char count.
+        private const int MaxInlineResultBytes = 30_000_000;
 
-        public ResultDeliveryService(HttpClient client, int port, Action<string>? onDelivered)
+        public ResultDeliveryService(IRevitBridgeTransport transport, int port, Action<string>? onDelivered)
         {
-            _client = client ?? throw new ArgumentNullException(nameof(client));
+            _transport = transport ?? throw new ArgumentNullException(nameof(transport));
             _store = new FileBackedPendingResultStore(port);
             _storePort = port;
             _onDelivered = onDelivered;
@@ -39,7 +43,7 @@ namespace RevitMCPAddin.Core.ResultDelivery
             if (string.IsNullOrWhiteSpace(baseAddress)) return;
             try
             {
-                _client.BaseAddress = new Uri(baseAddress, UriKind.Absolute);
+                _transport.SetBaseAddress(baseAddress);
             }
             catch (Exception ex)
             {
@@ -74,6 +78,9 @@ namespace RevitMCPAddin.Core.ResultDelivery
                 var persisted = _store.LoadAll();
                 foreach (var it in persisted)
                 {
+                    // A restart is a fresh delivery opportunity. Retaining a large historic
+                    // backoff here would block new results for many seconds at startup.
+                    it.Attempt = 0;
                     _queue.Enqueue(it);
                     _signal.Release();
                 }
@@ -133,6 +140,8 @@ namespace RevitMCPAddin.Core.ResultDelivery
 
                 SetActiveItem(item);
 
+                ReduceOversizedPayloadIfNeeded(item, "local hard limit");
+
                 var delayMs = GetRetryDelayMs(item.Attempt);
                 if (delayMs > 0)
                 {
@@ -147,11 +156,21 @@ namespace RevitMCPAddin.Core.ResultDelivery
 
                 try
                 {
-                    using var content = new StringContent(item.JsonBody, Encoding.UTF8, "application/json");
-                    using var res = await _client.PostAsync("post_result", content, ct).ConfigureAwait(false);
-                    if (!res.IsSuccessStatusCode)
+                    var delivery = await _transport.SendResultAsync(item.JsonBody, ct).ConfigureAwait(false);
+                    if (!delivery.IsSuccessStatusCode)
                     {
-                        throw new HttpRequestException("post_result returned " + (int)res.StatusCode);
+                        if (delivery.PayloadTooLarge && !item.PayloadReduced)
+                        {
+                            ReduceOversizedPayloadIfNeeded(item, "server returned payload-too-large", force: true);
+                            ClearActiveItem(item);
+                            _queue.Enqueue(item);
+                            _signal.Release();
+                            continue;
+                        }
+                        var detail = !string.IsNullOrWhiteSpace(delivery.Error)
+                            ? delivery.Error
+                            : ("status=" + delivery.StatusCode);
+                        throw new HttpRequestException(_transport.Name + " result delivery failed: " + detail);
                     }
 
                     // Success: clear persisted copy and stop heartbeat.
@@ -168,7 +187,7 @@ namespace RevitMCPAddin.Core.ResultDelivery
                     }
                     catch { /* ignore heartbeat callback errors */ }
 
-                    RevitLogger.Info($"[RESULT] delivered rpcId={item.RpcId} attempt={item.Attempt + 1}");
+                    RevitLogger.Info($"[RESULT] delivered transport={delivery.TransportName} rpcId={item.RpcId} attempt={item.Attempt + 1} transportMs={delivery.ElapsedMs}");
                     ClearActiveItem(item);
                 }
                 catch (OperationCanceledException)
@@ -292,6 +311,45 @@ namespace RevitMCPAddin.Core.ResultDelivery
             if (attempt == 2) return 1000;
             if (attempt == 3) return 3000;
             return 10000;
+        }
+
+        private void ReduceOversizedPayloadIfNeeded(PendingResultItem item, string reason, bool force = false)
+        {
+            if (item == null || item.PayloadReduced || string.IsNullOrWhiteSpace(item.JsonBody)) return;
+
+            int bytes;
+            try { bytes = Encoding.UTF8.GetByteCount(item.JsonBody); }
+            catch { bytes = item.JsonBody.Length * 2; }
+            if (!force && bytes <= MaxInlineResultBytes) return;
+
+            // Preserve the original envelope in the retry store until the compact response
+            // reaches the server. The persisted copy is deleted after successful delivery.
+            if (string.IsNullOrWhiteSpace(item.StorePath))
+            {
+                try { item.StorePath = _store.Save(item); }
+                catch (Exception ex) { RevitLogger.Warn($"[RESULT] oversized payload persistence failed rpcId={item.RpcId}: {ex.Message}"); }
+            }
+
+            item.OriginalPayloadBytes = bytes;
+            item.PayloadReduced = true;
+            item.Attempt = 0;
+            item.LastError = reason;
+
+            var envelope = new JObject
+            {
+                ["jsonrpc"] = "2.0",
+                ["id"] = item.RpcId ?? string.Empty,
+                ["result"] = new JObject
+                {
+                    ["ok"] = false,
+                    ["code"] = "RESULT_TOO_LARGE",
+                    ["msg"] = "The Revit command completed, but its result was too large for safe inline delivery. Rerun with paging, summaryOnly, or a file-export option.",
+                    ["originalPayloadBytes"] = bytes,
+                    ["deliveryLimitBytes"] = MaxInlineResultBytes
+                }
+            };
+            item.JsonBody = JsonNetCompat.ToCompactJson(envelope);
+            RevitLogger.Warn($"[RESULT] oversized payload reduced rpcId={item.RpcId} bytes={bytes} reason={reason}");
         }
     }
 }

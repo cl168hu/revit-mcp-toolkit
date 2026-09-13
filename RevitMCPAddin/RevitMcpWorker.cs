@@ -4,6 +4,7 @@
 using Autodesk.Revit.UI;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using RevitMCP.Abstractions.Bridge;
 using RevitMCPAddin.Commands;
 using RevitMCPAddin.Commands.AnalysisOps;
 using RevitMCPAddin.Commands.AnnotationOps;
@@ -84,6 +85,7 @@ using RevitMCPAddin.Commands.WorksetOps;
 using RevitMCPAddin.Commands.ZoneOps;
 using RevitMCPAddin.Core;
 using RevitMCPAddin.Core.ResultDelivery;
+using RevitMCPAddin.Core.Transport;
 using RevitMCPAddin.ExternalEvents;
 using RevitMCPAddin.RevitUI;
 using System;
@@ -104,8 +106,13 @@ namespace RevitMCPAddin
         {
             public RequestCommand Command { get; set; } = null!;
             public string JobId { get; set; } = string.Empty;
+            public string TransportName { get; set; } = "legacyHttp";
+            public string PipeRequestId { get; set; } = string.Empty;
             public int TimeoutMs { get; set; }
             public DateTime ClaimedAtUtc { get; set; } = DateTime.UtcNow;
+            public DateTime? TransportSentAtUtc { get; set; }
+            public DateTime? RaisedAtUtc { get; set; }
+            public DateTime? ExecutionStartedAtUtc { get; set; }
             public string RpcId
             {
                 get
@@ -119,6 +126,8 @@ namespace RevitMCPAddin
         private readonly ExternalEvent _extEvent;
         private readonly RevitCommandExecutor _executor;
         private readonly HttpClient _client;
+        private readonly IRevitBridgeTransport _bridgeTransport;
+        private readonly NamedPipeHandshakeClient _namedPipeHandshake;
         private readonly IResultDeliveryService _resultDelivery;
         private readonly int _port;
         private bool _isRunning;
@@ -152,7 +161,7 @@ namespace RevitMCPAddin
                                             : (!string.IsNullOrWhiteSpace(rpcId) ? ("rpcId=" + Uri.EscapeDataString(rpcId)) : null);
                                 if (!string.IsNullOrEmpty(qs))
                                 {
-                                    try { using var _ = await _client.GetAsync("heartbeat?" + qs).ConfigureAwait(false); }
+                                    try { await _bridgeTransport.SendHeartbeatAsync(rpcId, jobId, cts.Token).ConfigureAwait(false); }
                                     catch { }
                                 }
                                 await System.Threading.Tasks.Task.Delay(10000, cts.Token).ConfigureAwait(false);
@@ -187,7 +196,19 @@ namespace RevitMCPAddin
             return System.Threading.Volatile.Read(ref _dispatchInFlight) == 0;
         }
 
-        private void EnqueueDispatch(RequestCommand cmd, string? jobIdHeader)
+        private static bool IsNamedPipeTransport(string? transportName)
+        {
+            return string.Equals(transportName, "namedPipeReadOnly", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(transportName, "namedPipeDryRun", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private void EnqueueDispatch(
+            RequestCommand cmd,
+            string? jobIdHeader,
+            string transportName = "legacyHttp",
+            string? pipeRequestId = null,
+            DateTime? receivedAtUtc = null,
+            DateTime? transportSentAtUtc = null)
         {
             if (cmd == null) return;
             var timeoutMs = ResolveOpTimeoutMsFromParams(cmd, 120_000);
@@ -195,11 +216,14 @@ namespace RevitMCPAddin
             {
                 Command = cmd,
                 JobId = jobIdHeader ?? string.Empty,
+                TransportName = string.IsNullOrWhiteSpace(transportName) ? "legacyHttp" : transportName,
+                PipeRequestId = pipeRequestId ?? string.Empty,
                 TimeoutMs = timeoutMs,
-                ClaimedAtUtc = DateTime.UtcNow
+                ClaimedAtUtc = receivedAtUtc ?? DateTime.UtcNow,
+                TransportSentAtUtc = transportSentAtUtc
             };
             _dispatchQueue.Enqueue(item);
-            SafeLog($"[WORKER] claimed method={cmd.Command} rpcId={item.RpcId} queued={_dispatchQueue.Count}");
+            SafeLog($"[WORKER] claimed transport={item.TransportName} method={cmd.Command} rpcId={item.RpcId} queued={_dispatchQueue.Count}");
         }
 
         private void TryDispatchNext()
@@ -237,12 +261,14 @@ namespace RevitMCPAddin
                 }
 
                 _executor.SetNextTimeoutMs(item.TimeoutMs);
-                if (item.TimeoutMs >= 15_000)
+                if (item.TimeoutMs >= 15_000
+                    && !IsNamedPipeTransport(item.TransportName))
                 {
                     StartHeartbeat(item.RpcId, item.JobId);
                 }
 
-                SafeLog($"[WORKER] dispatch method={item.Command.Command} rpcId={item.RpcId} queued={_dispatchQueue.Count}");
+                item.RaisedAtUtc = DateTime.UtcNow;
+                SafeLog($"[WORKER] dispatch transport={item.TransportName} method={item.Command.Command} rpcId={item.RpcId} queued={_dispatchQueue.Count}");
                 var raiseResult = _extEvent.Raise();
                 if (raiseResult != ExternalEventRequest.Accepted)
                 {
@@ -300,6 +326,64 @@ namespace RevitMCPAddin
             finally
             {
                 _ = Task.Run(() => TryDispatchNext());
+            }
+        }
+
+        private bool OnNamedPipeReadOnlyCommand(NamedPipeReadOnlyCommand request)
+        {
+            if (!_isRunning || request == null) return false;
+            if (!NamedPipeReadOnlyAllowlist.Contains(request.Method))
+                return false;
+
+            var cmd = new RequestCommand
+            {
+                Jsonrpc = "2.0",
+                Id = new JValue(request.RpcId ?? request.RequestId),
+                Method = request.Method,
+                Params = request.Params ?? new JObject()
+            };
+
+            EnqueueDispatch(
+                cmd,
+                request.JobId,
+                transportName: "namedPipeReadOnly",
+                pipeRequestId: request.RequestId,
+                receivedAtUtc: request.ReceivedAtUtc,
+                transportSentAtUtc: request.ServerSentUtc);
+            TryDispatchNext();
+            return true;
+        }
+
+        private void OnCommandStarted(CommandExecutionStarted started)
+        {
+            try
+            {
+                DispatchItem? current;
+                lock (_dispatchLock)
+                {
+                    current = _currentDispatch;
+                    if (current == null || !string.Equals(current.RpcId, started?.RpcId ?? string.Empty, StringComparison.Ordinal))
+                        return;
+                    current.ExecutionStartedAtUtc = started!.StartedAtUtc;
+                }
+
+                var externalEventWaitMs = current.RaisedAtUtc.HasValue
+                    ? Math.Max(0, (long)(started!.StartedAtUtc - current.RaisedAtUtc.Value).TotalMilliseconds)
+                    : 0;
+                SafeLog($"[WORKER] started transport={current.TransportName} method={current.Command.Command} rpcId={current.RpcId} externalEventWaitMs={externalEventWaitMs}");
+
+                if (IsNamedPipeTransport(current.TransportName))
+                {
+                    _namedPipeHandshake.TryQueueStarted(
+                        current.PipeRequestId,
+                        current.JobId,
+                        current.RpcId,
+                        externalEventWaitMs);
+                }
+            }
+            catch (Exception ex)
+            {
+                SafeLog("[WORKER] command-start metric failed: " + ex.Message);
             }
         }
 
@@ -374,7 +458,12 @@ namespace RevitMCPAddin
                 BaseAddress = new Uri($"http://localhost:{_port}/"),
                 Timeout = TimeSpan.FromSeconds(8)
             };
-            _resultDelivery = new ResultDeliveryService(resultClient, _port, this.StopHeartbeat);
+            _bridgeTransport = new LegacyHttpRevitBridgeTransport(_client, resultClient, $"http://localhost:{_port}/");
+            _namedPipeHandshake = new NamedPipeHandshakeClient(
+                $"http://localhost:{_port}/",
+                application?.ControlledApplication?.VersionNumber ?? string.Empty);
+            _namedPipeHandshake.CommandReceived = OnNamedPipeReadOnlyCommand;
+            _resultDelivery = new ResultDeliveryService(_bridgeTransport, _port, this.StopHeartbeat);
             AppServices.ResultDelivery = _resultDelivery;
 
 
@@ -1399,6 +1488,7 @@ namespace RevitMCPAddin
             try { batchHandler.BindRouter(router); } catch { /* best-effort */ }
             _executor = new RevitMCPAddin.ExternalEvents.RevitCommandExecutor(router, _client, RevitMCPAddin.Core.RevitLogger.LogPath);
             _executor.EnqueueResultCallback = this.EnqueueResultForDelivery;
+            _executor.CommandStarted = this.OnCommandStarted;
             _executor.CommandCompleted = this.OnCommandCompleted;
             _extEvent = ExternalEvent.Create(_executor);
         }
@@ -1409,6 +1499,7 @@ namespace RevitMCPAddin
             _isRunning = true;
             LongOpEngine.Initialize(uiapp: null, baseAddress: new Uri($"http://127.0.0.1:{_port}/"));
             try { _resultDelivery.Start(); } catch (Exception ex) { SafeLog($"[WORKER] result delivery start failed: {ex.Message}"); }
+            try { _namedPipeHandshake.Start(); } catch (Exception ex) { SafeLog($"[BRIDGE] named-pipe handshake monitor start failed; legacyHttp remains active. {ex.Message}"); }
 
             Task.Run(async () =>
             {
@@ -1431,39 +1522,23 @@ namespace RevitMCPAddin
 
             try
             {
-                // Use server-side long-polling to reduce latency and spin
-                using var res = await _client.GetAsync("pending_request?waitMs=30000", HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
-                        string jobIdHeader = null;
-                        try
-                        {
-                            if (res.Headers.TryGetValues("X-Job-Id", out var __vals))
-                            {
-                                foreach (var v in __vals) { jobIdHeader = v; break; }
-                            }
-                        }
-                        catch { }
+                var receive = await _bridgeTransport.ReceiveAsync(30000, _cts.Token).ConfigureAwait(false);
+                        string jobIdHeader = receive.JobId;
 
                         // “仕事なし”判定
-                        if (!res.IsSuccessStatusCode || res.StatusCode == HttpStatusCode.NoContent)
+                        if (!receive.IsSuccessStatusCode || receive.IsNoContent)
                         {
                             AdaptiveWaitController.Instance.ReportPoll(false);
 
                             // Fallback diagnostic: if NoContent but jobs exist, rebind and retry sooner
-                            if (res.StatusCode == HttpStatusCode.NoContent)
+                            if (receive.IsNoContent)
                             {
                                 try
                                 {
-                                    using var peek = await _client.GetAsync("jobs?state=ENQUEUED&limit=1", HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
-                                    if (peek.IsSuccessStatusCode)
+                                    if (await _bridgeTransport.HasEnqueuedJobsAsync(_cts.Token).ConfigureAwait(false))
                                     {
-                                        var s = await peek.Content.ReadAsStringAsync().ConfigureAwait(false);
-                                        // Very light check to avoid JSON parse cost
-                                        if (!string.IsNullOrWhiteSpace(s) && s.TrimStart().StartsWith("["))
-                                        {
-                                            // If there seems to be at least one job, log and attempt a quick rebind
-                                            SafeLog($"[{DateTime.Now:HH:mm:ss}] WARN: pending_request returned 204 but jobs appear ENQUEUED. Will attempt quick rebind.");
-                                            TryRebindPortFromLock();
-                                        }
+                                        SafeLog($"[{DateTime.Now:HH:mm:ss}] WARN: pending_request returned 204 but jobs appear ENQUEUED. Will attempt quick rebind.");
+                                        TryRebindPortFromLock();
                                     }
                                 }
                                 catch { /* best-effort diagnostic */ }
@@ -1473,7 +1548,8 @@ namespace RevitMCPAddin
 
                         // 仕事あり
                         gotWork = true;
-                        var body = await res.Content.ReadAsStringAsync().ConfigureAwait(false);
+                        var body = receive.Payload;
+                        SafeLog($"[BRIDGE] receive transport={receive.TransportName} status={receive.StatusCode} transportMs={receive.ElapsedMs} bytes={Encoding.UTF8.GetByteCount(body ?? string.Empty)}");
                         SafeLog($"[{DateTime.Now:HH:mm:ss}] POLL BATCH: {TruncateForLog(body, 500)}");
 
                         var json = NormalizeIncomingJson(body);
@@ -1497,7 +1573,7 @@ namespace RevitMCPAddin
                             foreach (var cmd in cmdList)
                             {
                                 if (cmd == null) continue;
-                                EnqueueDispatch(cmd, jobIdHeader);
+                                EnqueueDispatch(cmd, jobIdHeader, receive.TransportName);
                             }
                             TryDispatchNext();
                         }
@@ -1516,7 +1592,7 @@ namespace RevitMCPAddin
 
                             if (cmd != null)
                             {
-                                EnqueueDispatch(cmd, jobIdHeader);
+                                EnqueueDispatch(cmd, jobIdHeader, receive.TransportName);
                                 TryDispatchNext();
                             }
                             else
@@ -1597,7 +1673,8 @@ namespace RevitMCPAddin
                     }
                     if (owner == me && port > 0)
                     {
-                        _client.BaseAddress = new Uri($"http://localhost:{port}/");
+                        _bridgeTransport.SetBaseAddress($"http://localhost:{port}/");
+                        try { _namedPipeHandshake.SetBaseAddress($"http://localhost:{port}/"); } catch { }
                         try { _resultDelivery.SetBaseAddress($"http://localhost:{port}/"); } catch { }
                         try { _resultDelivery.UpdatePort(port); } catch { }
                         try { RevitMCPAddin.AppServices.CurrentPort = port; } catch { }
@@ -1613,6 +1690,7 @@ namespace RevitMCPAddin
         {
             _isRunning = false;
             try { _cts.Cancel(); } catch { }
+            try { _namedPipeHandshake.Stop(); } catch { }
             try { _resultDelivery.Stop(); } catch { }
             if (ReferenceEquals(AppServices.ResultDelivery, _resultDelivery))
                 AppServices.ResultDelivery = null;
@@ -1695,10 +1773,13 @@ namespace RevitMCPAddin
 
             try
             {
-                var jsonBody = JsonConvert.SerializeObject(errorPayload, Formatting.None);
-                var content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
-                var res = await _client.PostAsync("post_result", content).ConfigureAwait(false);
-                SafeLog($"[{now:HH:mm:ss}] WORKER post_result(parse-error) => {(int)res.StatusCode}");
+                var jsonBody = JsonNetCompat.ToCompactJson(errorPayload);
+                if (string.Equals(jsonBody, "null", StringComparison.Ordinal))
+                    throw new JsonSerializationException("Parse-error response serialization failed.");
+                var delivery = await _bridgeTransport.SendResultAsync(jsonBody, System.Threading.CancellationToken.None).ConfigureAwait(false);
+                if (!delivery.IsSuccessStatusCode)
+                    throw new HttpRequestException(!string.IsNullOrWhiteSpace(delivery.Error) ? delivery.Error : ("status=" + delivery.StatusCode));
+                SafeLog($"[{now:HH:mm:ss}] WORKER post_result(parse-error) transport={delivery.TransportName} status={delivery.StatusCode} transportMs={delivery.ElapsedMs}");
             }
             catch (Exception postEx)
             {
@@ -1809,15 +1890,118 @@ namespace RevitMCPAddin
 
         private void EnqueueResultForDelivery(string? rpcId, string jsonBody)
         {
+            DispatchItem? dispatch = null;
+            lock (_dispatchLock)
+            {
+                if (_currentDispatch != null
+                    && string.Equals(_currentDispatch.RpcId, rpcId ?? string.Empty, StringComparison.Ordinal))
+                {
+                    dispatch = _currentDispatch;
+                }
+            }
+
+            var annotatedJson = AnnotateBridgeTimings(jsonBody, dispatch);
+            if (dispatch != null
+                && IsNamedPipeTransport(dispatch.TransportName))
+            {
+                var now = DateTime.UtcNow;
+                var externalEventWaitMs = dispatch.RaisedAtUtc.HasValue && dispatch.ExecutionStartedAtUtc.HasValue
+                    ? Math.Max(0, (long)(dispatch.ExecutionStartedAtUtc.Value - dispatch.RaisedAtUtc.Value).TotalMilliseconds)
+                    : 0;
+                var executionToResultMs = dispatch.ExecutionStartedAtUtc.HasValue
+                    ? Math.Max(0, (long)(now - dispatch.ExecutionStartedAtUtc.Value).TotalMilliseconds)
+                    : 0;
+                var queued = _namedPipeHandshake.TryQueueResult(
+                    dispatch.PipeRequestId,
+                    dispatch.JobId,
+                    dispatch.RpcId,
+                    annotatedJson,
+                    externalEventWaitMs,
+                    executionToResultMs);
+                SafeLog($"[RESULT] queued transport={dispatch.TransportName} rpcId={dispatch.RpcId} ok={queued} externalEventWaitMs={externalEventWaitMs}");
+                return;
+            }
+
             var item = new PendingResultItem
             {
                 RpcId = rpcId ?? string.Empty,
                 HeartbeatKey = rpcId ?? string.Empty,
-                JsonBody = jsonBody ?? string.Empty,
+                JsonBody = annotatedJson,
                 CreatedAtUtc = DateTime.UtcNow,
                 Attempt = 0
             };
             _resultDelivery.Enqueue(item);
+        }
+
+        private static string AnnotateBridgeTimings(string jsonBody, DispatchItem? dispatch)
+        {
+            if (dispatch == null || string.IsNullOrWhiteSpace(jsonBody))
+                return jsonBody ?? string.Empty;
+
+            try
+            {
+                var root = JObject.Parse(jsonBody);
+                var payload = root["result"] as JObject;
+                if (payload == null) return jsonBody;
+
+                var now = DateTime.UtcNow;
+                var claimToRaiseMs = dispatch.RaisedAtUtc.HasValue
+                    ? Math.Max(0, (long)(dispatch.RaisedAtUtc.Value - dispatch.ClaimedAtUtc).TotalMilliseconds)
+                    : 0;
+                var externalEventWaitMs = dispatch.RaisedAtUtc.HasValue && dispatch.ExecutionStartedAtUtc.HasValue
+                    ? Math.Max(0, (long)(dispatch.ExecutionStartedAtUtc.Value - dispatch.RaisedAtUtc.Value).TotalMilliseconds)
+                    : 0;
+                var executionToResultMs = dispatch.ExecutionStartedAtUtc.HasValue
+                    ? Math.Max(0, (long)(now - dispatch.ExecutionStartedAtUtc.Value).TotalMilliseconds)
+                    : 0;
+                var serverToAddinMs = dispatch.TransportSentAtUtc.HasValue
+                    ? Math.Max(0, (long)(dispatch.ClaimedAtUtc - dispatch.TransportSentAtUtc.Value).TotalMilliseconds)
+                    : -1;
+
+                payload["bridgeTransport"] = dispatch.TransportName;
+                payload["bridgeTimings"] = new JObject
+                {
+                    ["serverToAddinMs"] = serverToAddinMs,
+                    ["claimToRaiseMs"] = claimToRaiseMs,
+                    ["externalEventWaitMs"] = externalEventWaitMs,
+                    ["executionToResultQueueMs"] = executionToResultMs,
+                    ["addinElapsedMs"] = Math.Max(0, (long)(now - dispatch.ClaimedAtUtc).TotalMilliseconds)
+                };
+
+                var timings = FindTimingsObject(payload, 0);
+                if (timings != null)
+                {
+                    timings["externalEventWaitMs"] = externalEventWaitMs;
+                    timings["bridgeClaimToRaiseMs"] = claimToRaiseMs;
+                    timings["bridgeTransport"] = dispatch.TransportName;
+                }
+
+                return JsonNetCompat.ToCompactJson(root);
+            }
+            catch
+            {
+                return jsonBody;
+            }
+        }
+
+        private static JObject? FindTimingsObject(JToken? token, int depth)
+        {
+            if (token == null || depth > 8) return null;
+            if (token is JObject obj)
+            {
+                if (obj["timings"] is JObject timings) return timings;
+                if (obj["result"] != null)
+                {
+                    var nested = FindTimingsObject(obj["result"], depth + 1);
+                    if (nested != null) return nested;
+                }
+                if (obj["data"] != null)
+                {
+                    var nested = FindTimingsObject(obj["data"], depth + 1);
+                    if (nested != null) return nested;
+                }
+            }
+            return null;
         }
 
         // ============================================================

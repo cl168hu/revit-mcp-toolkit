@@ -39,7 +39,23 @@ namespace RevitMCPAddin.Core.Net
             {
                 try
                 {
-                    try { gateTaken = gate.WaitOne(millisecondsTimeout: 15000); } catch { gateTaken = false; }
+                    try
+                    {
+                        gateTaken = gate.WaitOne(millisecondsTimeout: 15000);
+                    }
+                    catch (AbandonedMutexException)
+                    {
+                        // The previous starter terminated while holding the gate.
+                        // Ownership is transferred to this thread, so it is safe to proceed.
+                        gateTaken = true;
+                    }
+                    catch
+                    {
+                        gateTaken = false;
+                    }
+
+                    if (!gateTaken)
+                        return (false, BasePort, "Server start is already in progress. Please retry shortly.");
 
                     CleanupStaleLocks(stopAll: false);
 
@@ -53,7 +69,7 @@ namespace RevitMCPAddin.Core.Net
 
                     if (ReadLock(BasePort) == null) // 生存なし
                     {
-                    var res = StartServerOnPort(BasePort);
+                    var res = StartServerOnPort(BasePort, ownerPid);
                     if (res.ok) WriteLock(res.actualPort, res.pid, ownerPid);
                     return (res.ok, res.actualPort, res.msg);
                     }
@@ -76,7 +92,7 @@ namespace RevitMCPAddin.Core.Net
                 if (info != null) TryDeleteLock(BasePort);
                 if (IsPortFree(BasePort))
                 {
-                    var resAgain = StartServerOnPort(BasePort);
+                    var resAgain = StartServerOnPort(BasePort, ownerPid);
                     if (resAgain.ok) WriteLock(resAgain.actualPort, resAgain.pid, ownerPid);
                     return (resAgain.ok, resAgain.actualPort, resAgain.msg);
                 }
@@ -93,7 +109,7 @@ namespace RevitMCPAddin.Core.Net
                         }
                         if (IsPortFree(p))
                         {
-                            var res2 = StartServerOnPort(p);
+                            var res2 = StartServerOnPort(p, ownerPid);
                             if (res2.ok) { WriteLock(res2.actualPort, res2.pid, ownerPid); return (true, res2.actualPort, res2.msg); }
                         }
                     }
@@ -128,6 +144,19 @@ namespace RevitMCPAddin.Core.Net
                 if (info.Value.ownerPid != ownerPid)
                     return (true, $"skip stop: not owner (lock.ownerPid={info.Value.ownerPid}, me={ownerPid})");
 
+                var gracefulRequested = TryRequestGracefulShutdown(port, 3000, out var gracefulMessage);
+                if (gracefulRequested && WaitForProcessExit(info.Value.serverPid, 5000))
+                {
+                    // The Server releases its own exact port lock from
+                    // ApplicationStopped. Remove a leftover only after verifying
+                    // that the recorded process has exited.
+                    TryDeleteLock(port);
+                    return (true, $"stopped gracefully by lock: {port} ({gracefulMessage})");
+                }
+
+                // Compatibility fallback for an older or unresponsive Server.
+                // The owner PID and exact server PID were already verified above;
+                // never stop a different Revit instance's server here.
                 try
                 {
                     var p = Process.GetProcessById(info.Value.serverPid);
@@ -137,8 +166,11 @@ namespace RevitMCPAddin.Core.Net
                 {
                     // 既に終了している等 → ロックだけ削除
                 }
+                if (!WaitForProcessExit(info.Value.serverPid, 2000))
+                    return (false, $"server did not stop: {port} ({gracefulMessage})");
+
                 TryDeleteLock(port);
-                return (true, $"stopped by lock: {port}");
+                return (true, $"stopped by exact-PID fallback: {port} ({gracefulMessage})");
             }
             catch (Exception ex)
             {
@@ -226,7 +258,6 @@ namespace RevitMCPAddin.Core.Net
                 if (waitMs < 0) waitMs = 0;
                 var deadline = DateTime.UtcNow.AddMilliseconds(waitMs);
                 int lastPid = 0;
-                bool lastLock = false;
 
                 while (true)
                 {
@@ -237,7 +268,6 @@ namespace RevitMCPAddin.Core.Net
                         return (free, free ? "lock not found; port free" : "lock not found; port busy", lastPid, false);
                     }
 
-                    lastLock = true;
                     lastPid = info.Value.serverPid;
 
                     if (!IsProcessAlive(info.Value.serverPid))
@@ -257,7 +287,7 @@ namespace RevitMCPAddin.Core.Net
 
         // -------------------- Internals --------------------
 
-        private static (bool ok, int pid, int actualPort, string msg) StartServerOnPort(int port)
+        private static (bool ok, int pid, int actualPort, string msg) StartServerOnPort(int port, int ownerPid)
         {
             if (!IsPortFree(port))
                 return (false, 0, port, $"port {port} is busy");
@@ -284,7 +314,7 @@ namespace RevitMCPAddin.Core.Net
                 var psi = new ProcessStartInfo
                 {
                     FileName = exe,
-                    Arguments = $"--port {port}",
+                    Arguments = $"--port {port} --owner-pid {ownerPid}",
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     WorkingDirectory = Path.GetDirectoryName(exe) ?? Environment.CurrentDirectory
@@ -416,6 +446,57 @@ namespace RevitMCPAddin.Core.Net
             catch { return false; }
         }
 
+        private static bool WaitForProcessExit(int pid, int waitMs)
+        {
+            if (pid <= 0) return true;
+            try
+            {
+                using (var process = Process.GetProcessById(pid))
+                {
+                    if (process.HasExited) return true;
+                    process.WaitForExit(Math.Max(0, waitMs));
+                    return process.HasExited;
+                }
+            }
+            catch
+            {
+                // Process.GetProcessById throws after a confirmed exit.
+                return true;
+            }
+        }
+
+        private static bool TryRequestGracefulShutdown(int port, int timeoutMs, out string message)
+        {
+            message = string.Empty;
+            if (port <= 0 || port > 65535)
+            {
+                message = "invalid port";
+                return false;
+            }
+
+            try
+            {
+                var request = (HttpWebRequest)WebRequest.Create($"http://127.0.0.1:{port}/shutdown");
+                request.Method = "POST";
+                request.Proxy = null;
+                request.ContentLength = 0;
+                request.Timeout = Math.Max(250, timeoutMs);
+                request.ReadWriteTimeout = Math.Max(250, timeoutMs);
+                request.KeepAlive = false;
+                using (var response = (HttpWebResponse)request.GetResponse())
+                {
+                    var status = (int)response.StatusCode;
+                    message = "HTTP " + status.ToString();
+                    return status >= 200 && status < 300;
+                }
+            }
+            catch (Exception ex)
+            {
+                message = ex.GetType().Name + ": " + ex.Message;
+                return false;
+            }
+        }
+
         // ---------- Locks ----------
         private struct LockInfo { public int port; public int serverPid; public int ownerPid; public string path; }
 
@@ -442,19 +523,39 @@ namespace RevitMCPAddin.Core.Net
                 using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                 using (var sr = new StreamReader(fs))
                     txt = sr.ReadToEnd();
-                int pid = 0;
-                int owner = 0;
-                string exe = "";
-                foreach (var line in txt.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
-                {
-                    if (line.StartsWith("pid=") && int.TryParse(line.Substring(4), out var p)) pid = p;
-                    else if (line.StartsWith("ownerPid=") && int.TryParse(line.Substring(9), out var o)) owner = o;
-                    else if (line.StartsWith("path=")) exe = line.Substring(5);
-                }
+                int pid = ReadLockInt(txt, "pid");
+                int owner = ReadLockInt(txt, "ownerPid");
+                string exe = ReadLockString(txt, "path");
                 if (pid <= 0) return null;
                 return new LockInfo { port = port, serverPid = pid, ownerPid = owner, path = exe };
             }
             catch { return null; }
+        }
+
+        private static int ReadLockInt(string text, string key)
+        {
+            try
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(
+                    text ?? string.Empty,
+                    "(?:^|[,\\r\\n])\\s*" + System.Text.RegularExpressions.Regex.Escape(key) + "\\s*=\\s*(\\d+)",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                return match.Success && int.TryParse(match.Groups[1].Value, out var value) ? value : 0;
+            }
+            catch { return 0; }
+        }
+
+        private static string ReadLockString(string text, string key)
+        {
+            try
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(
+                    text ?? string.Empty,
+                    "(?:^|[,\\r\\n])\\s*" + System.Text.RegularExpressions.Regex.Escape(key) + "\\s*=\\s*([^\\r\\n,]*)",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                return match.Success ? match.Groups[1].Value.Trim() : string.Empty;
+            }
+            catch { return string.Empty; }
         }
 
         private static void TryDeleteLock(int port)

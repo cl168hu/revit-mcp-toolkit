@@ -1,6 +1,7 @@
 #nullable enable
 using System;
 using System.Collections.Generic;
+using System.Text;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -18,16 +19,13 @@ namespace RevitMCPAddin.Core
             if (value == null) return "null";
             try
             {
-                var payload = value;
-
                 // IMPORTANT:
                 // Some Revit host environments can end up with mixed Json.NET types/versions.
                 // Serializing JToken directly may hit MissingMethodException (WriteTo / ToString overloads).
-                // Convert to plain CLR objects first.
                 if (value is JToken jt)
-                    payload = ToPlainObject(jt);
+                    return SerializeToken(jt, indented: false);
 
-                return JsonConvert.SerializeObject(payload);
+                return JsonConvert.SerializeObject(value);
             }
             catch
             {
@@ -40,16 +38,109 @@ namespace RevitMCPAddin.Core
             if (value == null) return "null";
             try
             {
-                var payload = value;
                 if (value is JToken jt)
-                    payload = ToPlainObject(jt);
+                    return SerializeToken(jt, indented: true);
 
-                return JsonConvert.SerializeObject(payload, Formatting.Indented);
+                return JsonConvert.SerializeObject(value, Formatting.Indented);
             }
             catch
             {
                 return "null";
             }
+        }
+
+        /// <summary>
+        /// Removes a root JToken from an otherwise plain object graph before the graph is
+        /// handed to JsonConvert. This is used for legacy envelopes and operation logs that
+        /// embed request/result tokens inside ordinary CLR DTOs.
+        /// </summary>
+        public static object? ToPlainValue(object? value)
+        {
+            return value is JToken token ? ToPlainObject(token) : value;
+        }
+
+        private static string SerializeToken(JToken token, bool indented)
+        {
+            var builder = new StringBuilder();
+            AppendToken(builder, token, indented, depth: 0);
+            return builder.ToString();
+        }
+
+        private static void AppendToken(StringBuilder builder, JToken token, bool indented, int depth)
+        {
+            if (token == null)
+            {
+                builder.Append("null");
+                return;
+            }
+
+            if (token is JValue value)
+            {
+                builder.Append(JsonConvert.SerializeObject(value.Value, Formatting.None));
+                return;
+            }
+
+            if (token is JObject obj)
+            {
+                builder.Append('{');
+                bool first = true;
+                foreach (var property in obj.Properties())
+                {
+                    if (!first) builder.Append(',');
+                    if (indented)
+                    {
+                        builder.AppendLine();
+                        AppendIndent(builder, depth + 1);
+                    }
+
+                    builder.Append(JsonConvert.SerializeObject(property.Name ?? string.Empty, Formatting.None));
+                    builder.Append(indented ? ": " : ":");
+                    AppendToken(builder, property.Value, indented, depth + 1);
+                    first = false;
+                }
+
+                if (!first && indented)
+                {
+                    builder.AppendLine();
+                    AppendIndent(builder, depth);
+                }
+                builder.Append('}');
+                return;
+            }
+
+            if (token is JArray array)
+            {
+                builder.Append('[');
+                bool first = true;
+                foreach (var item in array)
+                {
+                    if (!first) builder.Append(',');
+                    if (indented)
+                    {
+                        builder.AppendLine();
+                        AppendIndent(builder, depth + 1);
+                    }
+
+                    AppendToken(builder, item, indented, depth + 1);
+                    first = false;
+                }
+
+                if (!first && indented)
+                {
+                    builder.AppendLine();
+                    AppendIndent(builder, depth);
+                }
+                builder.Append(']');
+                return;
+            }
+
+            throw new JsonSerializationException("Unsupported JToken type: " + token.Type);
+        }
+
+        private static void AppendIndent(StringBuilder builder, int depth)
+        {
+            if (depth <= 0) return;
+            builder.Append(' ', checked(depth * 2));
         }
 
         private static object? ToPlainObject(JToken token)

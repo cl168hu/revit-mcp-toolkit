@@ -33,7 +33,10 @@ namespace RevitMcpServer.Infra
         /// Tries the preferred port, then 5210..5219 in order (deduped), returning the first
         /// port for which lock + bind test succeeds. Throws if none available.
         /// </summary>
-        public static int AcquireAvailablePort(int preferred)
+        public static int AcquireAvailablePort(
+            int preferred,
+            int ownerProcessId = 0,
+            string? serverExecutablePath = null)
         {
             var order = new List<int>();
             if (preferred > 0) order.Add(preferred);
@@ -47,8 +50,17 @@ namespace RevitMcpServer.Infra
                 // Try to acquire lock file exclusively
                 try
                 {
-                    fs = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-                    var txt = $"pid={Environment.ProcessId}, port={port}, ts={DateTime.Now:yyyy-MM-dd HH:mm:ss}";
+                    // The Server owns the write handle, while the Add-in must be
+                    // able to read the exact Server/Revit ownership identity.
+                    // Deny concurrent writers but permit concurrent readers.
+                    fs = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+                    var normalizedPath = NormalizeLockValue(
+                        serverExecutablePath ?? Environment.ProcessPath ?? string.Empty);
+                    var txt = "pid=" + Environment.ProcessId + "\n"
+                        + "ownerPid=" + Math.Max(0, ownerProcessId) + "\n"
+                        + "path=" + normalizedPath + "\n"
+                        + "port=" + port + "\n"
+                        + "startedAtUtc=" + DateTimeOffset.UtcNow.ToString("o");
                     var bytes = Encoding.UTF8.GetBytes(txt);
                     fs.SetLength(0);
                     fs.Write(bytes, 0, bytes.Length);
@@ -86,6 +98,13 @@ namespace RevitMcpServer.Infra
             throw new InvalidOperationException("No available port among 5210..5219 (including preferred).");
         }
 
+        private static string NormalizeLockValue(string? value)
+        {
+            return (value ?? string.Empty)
+                .Replace("\r", string.Empty)
+                .Replace("\n", string.Empty);
+        }
+
         /// <summary>
         /// Releases the lock and deletes the lock file, if any.
         /// </summary>
@@ -104,4 +123,3 @@ namespace RevitMcpServer.Infra
         }
     }
 }
-
