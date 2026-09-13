@@ -29,7 +29,7 @@
 
 ## 最近の更新
 
-- **2026-09-13: ブリッジ性能と安定性の改善**: read-only コマンドの Named Pipe 高速経路、ジョブ完了 long-poll、結果返却の再試行強化、Revit 側 Idling 負荷低減を追加しました。新規 MCP コマンド群のうち要判断のものは今回の公開対象に含めていません。
+- **2026-09-13: ブリッジ性能と安定性の改善**: read-only コマンドの Named Pipe 高速経路、ジョブ完了 long-poll、結果返却の再試行強化、Revit 側 Idling 負荷低減を追加しました。
 - **2026-05-13: HTML集計表・Excel入出力のバグ修正**: ブラウザ経由の集計表 Excel export / import preview / apply / verify を修正し、外部編集した集計表をより安全に Revit へ戻せるようにしました。
 - **HTML集計表・Excel連携**: ブラウザで集計表を確認し、Excel 書き出し、差分確認、Revit 側確認付き反映まで進められる導線を強化しています。
 - **A2A adapter**: A2A 風 HTTP/JSON-RPC 入口から既存の Revit MCP queue へ橋渡しできる `RevitMCP.A2AAdapter` を追加しています。

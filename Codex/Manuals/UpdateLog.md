@@ -8,7 +8,7 @@
 - MCP `tools/call` と `/job/{id}` の待機をジョブ完了シグナル付き long-poll にし、短い固定間隔ポーリングを減らした。
 - Add-in の結果返却キューを transport 共通化し、再試行、巨大 payload の圧縮エラー化、送受信 timing 記録を強化した。
 - Revit の `Idling` で毎回 selection を読む処理を避け、`SelectionChanged` イベント中心にして UI スレッド負荷を下げた。
-- 要判断の新規 MCP コマンド群は今回の公開対象から除外。公開版の Named Pipe dispatch は read-only allowlist のみを対象にする。
+- 公開版の Named Pipe dispatch は read-only allowlist のみを対象にする。
 
 ### HTML集計表・Excel連携
 - ブラウザの HTML 画面から Revit 集計表を選択し、プレビュー、Excel 書き出し、差分確認、Revit 側確認付き反映まで扱える。
@@ -55,7 +55,7 @@
 
 ### 目的
 - Revit MCP Server と Add-in の間の待機・結果返却・状態共有を軽くし、連続実行時の応答待ちと UI スレッド負荷を下げる。
-- 最新ソースに含まれる要判断の新規 MCP コマンド群は公開せず、性能改善の土台だけを安全に公開する。
+- 今回の更新は、性能改善と安定化の土台に対象を限定する。
 
 ### 変更概要
 - `pending_request` の claim 処理を `BridgeDispatchCoordinator` に集約し、ジョブ追加シグナルで long-poll を起こす構成にした。
@@ -80,7 +80,6 @@
 - `RevitMCP.Abstractions/Bridge/*`
 
 ### 公開対象外
-- 要判断の新規 MCP コマンド群。
 - Office 文書、CSV/TSV、Revit/CAD データ、実行バイナリ、ローカル作業フォルダ。
 
 ## 2026-05-13 HTML経由の集計表 Excel 入出力バグ修正
